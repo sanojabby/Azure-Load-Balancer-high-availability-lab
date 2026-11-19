@@ -264,8 +264,8 @@ Both nodes back in service, alternating again.
 Two practical differences worth remembering for AZ-700:
 
 - Azure Load Balancer is a Layer 4 forwarder, so a failed flow to a dead backend is a
-  connection reset to the client unless the client retries. The seamless masking seen
-  here comes from HAProxy's Layer 7 retry, which a pure Layer 4 balancer does not do.
+  connection reset to the client unless the client retries. What hides that from the client is
+  HAProxy's Layer 7 retry, which a pure Layer 4 balancer does not do.
 - Azure's default probe behaviour (probe every 15 s, two failures) is much slower than
   the 1.5 s achieved here. Faster detection is available by lowering the interval, and
   the trade-off is probe traffic versus detection speed, exactly as configured in
