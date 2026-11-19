@@ -82,6 +82,65 @@ Nginx 1.24.0                backends
 VirtualBox 7.2.14           host hypervisor, macOS
 ```
 
+## What it looks like
+
+Screenshots of each stage, taken from the running lab. I captured them with headless Chrome
+pointed at `192.168.56.10`, so the browser frame is mine and everything inside it is the
+real pool answering at that moment.
+
+### Provisioning
+
+The guests installed themselves from a cloud-init seed with no interaction, which is why
+the image below mattered: the installer sat in `run_unattended_upgrades` showing no
+progress, and only the console told me it had stalled instead of working.
+
+![Ubuntu autoinstall stalled during dist-upgrade](screenshots/02-installer-stuck-dist-upgrade.png)
+
+That stall is written up in `troubleshooting/install-autoinstall-failures.md`. Each of the
+four VMs went through a console like this one.
+
+### The two web nodes
+
+Both backends serve the same page with the node identity baked into it, so any screenshot
+says which one answered. These are two separate requests through the balancer, one
+round-robin step apart.
+
+![NordicShop page served by web01](screenshots/03-web-tier-web01.png)
+
+`NODE 1`, `web01`, `192.168.56.21`.
+
+![NordicShop page served by web02](screenshots/03-web-tier-web02.png)
+
+`NODE 2`, `web02`, `192.168.56.22`. Same URL, different server, and the client never chose.
+
+### The load balancer's view of the pool
+
+HAProxy's stats page on port 8404 is the closest thing this lab has to a dashboard, and it
+is what I watched during every incident.
+
+![HAProxy statistics page with both backends up](screenshots/04-lb-stats-healthy.png)
+
+Both servers green, `Status UP`, `LastChk L7OK/200`, equal weight on `nordicshop_web`.
+That bottom line is the state I expect to see before I break anything.
+
+### A failure, caught while it was happening
+
+I re-ran Incident 1 for this image: stopped Nginx on web01, waited three seconds, captured
+the stats page, then started Nginx again.
+
+![HAProxy statistics page with web01 down](screenshots/05-incident1-web01-down.png)
+
+`web01` is red with `L4CON in 2ms`, a downtime timer of three seconds and a growing queue;
+`web02` is untouched and still `UP`. The frontend row stays `OPEN` throughout, which is the
+whole point of the incident: the pool lost half its capacity and the customer saw `200`s.
+
+### What is not screenshotted
+
+Incidents 2, 3 and 5, and the total outage in Incident 4, are recorded as measured terminal
+output in their reports. For Incident 4 I tried to capture the browser's connection error
+and could not: headless Chrome exits cleanly on a failed navigation without writing an
+image. Rather than fake that frame, the outage stays a table of 33 failed requests.
+
 ## The five incidents
 
 Each one was run with samplers capturing the client's view and the pool's view at the
@@ -184,8 +243,10 @@ keep-alive from pinning clients here. I did not know that when I made the decisi
 
 ### Screenshots
 
-`screenshots/` holds real console captures from provisioning, including the autoinstall
-stall and the apt failure. Nothing in there was recreated.
+`screenshots/` holds real captures only: the provisioning consoles including the
+autoinstall stall and the apt failure, plus the running lab from the section above. The
+browser screenshots were taken with headless Chrome; the console ones are frames of the
+VirtualBox display. Nothing in there was recreated.
 
 ## Rebuilding the lab
 
