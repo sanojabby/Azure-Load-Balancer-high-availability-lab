@@ -101,8 +101,78 @@ project.
 
 ![The four NordicShop VMs running in VirtualBox Manager](screenshots/01-virtualbox-manager-four-vms.png)
 
-`lb01` finished cloud-init at 18:19:44, printed the `nordicshop-lab` key it had installed
-for `labadmin`, and dropped to a login prompt.
+All four are the same size: one vCPU, 1024 MB, a single 20 GB thin disk and two NICs, one
+NAT for package installation and one host-only `LabNet` NIC that carries the lab. What
+differs is the job each one does, so below is each machine on its own, with the panel the
+host shows for it and what that machine actually holds.
+
+### What each machine holds
+
+#### lb01, the load balancer
+
+![What lb01 holds, in the VirtualBox details panel](screenshots/01-vm-details-lb01.png)
+
+| What | Value |
+| --- | --- |
+| Job | Takes every customer request and picks a backend. It is the only address the customer uses. |
+| Lab address | `192.168.56.10` on the host-only `LabNet` NIC |
+| Hardware | 1 vCPU, 1024 MB, `nordicshop-lb01.vdi` at 20 GB |
+| Software | HAProxy 2.8.30, listening on `192.168.56.10:80` and `192.168.56.10:8404` |
+| Config | `/etc/haproxy/haproxy.cfg`, beside a timestamped `.bak` left by the last deploy |
+| Logs | `/var/log/haproxy.log`, one line per request with the node that answered it |
+| Firewall | 22 from the lab and NAT; 80 and 8404 from `192.168.56.0/24` only |
+| Not here | No web content of its own. When HAProxy stops, the whole site is gone, which is Incident 4. |
+
+#### web01, node 1
+
+![What web01 holds, in the VirtualBox details panel](screenshots/01-vm-details-web01.png)
+
+| What | Value |
+| --- | --- |
+| Job | Nginx backend, serves the shop page and the health endpoint the balancer probes |
+| Lab address | `192.168.56.21` |
+| Hardware | 1 vCPU, 1024 MB, `nordicshop-web01.vdi` at 20 GB |
+| Software | Nginx 1.24.0, listening on `0.0.0.0:80` |
+| Serves | `/var/www/nordicshop/index.html`, which prints NODE 1 and `192.168.56.21`, plus `/healthz` returning `ok web01` |
+| Headers | `X-Web-Node: web01` and `Cache-Control: no-store`, so a cached page cannot pass for a node |
+| Firewall | 80 from `192.168.56.10` only, so neither the client nor this Mac can reach it directly |
+| Not here | No database, no session store. The node is deliberately stateless so either one can answer. |
+
+#### web02, node 2
+
+![What web02 holds, in the VirtualBox details panel](screenshots/01-vm-details-web02.png)
+
+| What | Value |
+| --- | --- |
+| Job | The second backend, identical in every way that matters to a request |
+| Lab address | `192.168.56.22` |
+| Hardware | 1 vCPU, 1024 MB, `nordicshop-web02.vdi` at 20 GB |
+| Software | Nginx 1.24.0, listening on `0.0.0.0:80` |
+| Serves | The same page with NODE 2 and `192.168.56.22`, and `/healthz` returning `ok web02` |
+| Headers | `X-Web-Node: web02`, `Cache-Control: no-store` |
+| Firewall | 80 from `192.168.56.10` only |
+| Not here | Nothing distinct from web01. That is the point: the page tells you which node answered, and nothing else does. |
+
+#### client01, the customer
+
+![What client01 holds, in the VirtualBox details panel](screenshots/01-vm-details-client01.png)
+
+| What | Value |
+| --- | --- |
+| Job | Sends the traffic and records what came back. In every incident this is the customer's view. |
+| Lab address | `192.168.56.31` |
+| Hardware | 1 vCPU, 1024 MB, `nordicshop-client01.vdi` at 20 GB |
+| Software | `curl` and `jq`; the samplers in `scripts/` run from this Mac over SSH |
+| Listening | SSH only. There is no web server on it |
+| Firewall | 22 from the lab and NAT |
+| Not here | No content and no state. If this machine is the only one that fails, nothing about the service changes. |
+
+### The consoles at install time
+
+The details panels say what each machine was given. The consoles say what it did with it.
+
+`lb01` finished cloud-init at 18:19:44, installed the `nordicshop-lab` key for `labadmin`
+and dropped to a login prompt.
 
 ![lb01 console after a complete autoinstall](screenshots/02-installer-console-lb01.png)
 
