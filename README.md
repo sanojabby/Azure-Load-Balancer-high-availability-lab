@@ -88,16 +88,93 @@ Screenshots of each stage, taken from the running lab. I captured them with head
 pointed at `192.168.56.10`, so the browser frame is mine and everything inside it is the
 real pool answering at that moment.
 
-### Provisioning
+### The four VMs
 
-The guests installed themselves from a cloud-init seed with no interaction, which is why
-the image below mattered: the installer sat in `run_unattended_upgrades` showing no
-progress, and only the console told me it had stalled instead of working.
+Every guest has its own console, and those consoles carried information the host could not
+give me. Two of them came up cleanly. The other two stalled, and that is the part worth
+showing.
 
-![Ubuntu autoinstall stalled during dist-upgrade](screenshots/02-installer-stuck-dist-upgrade.png)
+`lb01` finished cloud-init at 18:19:44, printed the `nordicshop-lab` key it had installed
+for `labadmin`, and dropped to a login prompt.
 
-That stall is written up in `troubleshooting/install-autoinstall-failures.md`. Each of the
-four VMs went through a console like this one.
+![lb01 console after a complete autoinstall](screenshots/02-installer-console-lb01.png)
+
+`client01` did the same at 18:38:06. That `client01 login:` line is how I confirmed the
+guest had come up with the hostname I asked for, rather than with something the installer
+made up.
+
+![client01 console after a complete autoinstall](screenshots/02-installer-console-client01.png)
+
+`web01` and `web02` never got that far on the first attempt. Both stopped on the same line,
+`run_unattended_upgrades`, which runs `apt-get dist-upgrade` inside the target system and
+prints nothing while it runs.
+
+![web01 installer sitting in run_unattended_upgrades](screenshots/02-installer-console-web01.png)
+
+![web02 installer sitting in run_unattended_upgrades](screenshots/02-installer-console-web02.png)
+
+### How the installs failed, and how I got past them
+
+This is the part of the build that cost me the most time, so it goes in the order it
+happened.
+
+The first attempt failed loudly. The installer worked through network, mirror and locale,
+then stopped with:
+
+```
+curtin command in-target returned non-zero exit status 1
+An error occurred. Press enter to start a shell
+```
+
+I took that shell and checked the obvious thing first: the network. The archive answered a
+ping in 37 ms, so connectivity was never the problem. What the shell did show was that
+`/etc/resolv.conf` named no server, and that `/target` had already been torn down, so the
+failing `apt-get update` could not be re-run to read its own error.
+
+![The installer recovery shell after curtin exited 1](screenshots/troubleshooting-apt-failure.png)
+
+The cause was the resolver. The installer resolves through systemd-resolved's stub on
+`127.0.0.53`, and inside the target chroot during `curtin in-target` there is nothing
+behind that stub, so apt could not resolve the archive even though the installer
+environment could. The fix was to write a real resolver before the target gets configured,
+so curtin copies a working one into the chroot:
+
+```yaml
+early-commands:
+  - sh -c 'printf "nameserver 10.0.2.3\nnameserver 1.1.1.1\n" > /etc/resolv.conf'
+```
+
+`10.0.2.3` is VirtualBox's own NAT DNS service. With that in place the same stage completed
+and curtin moved on to packages, kernel and bootloader.
+
+The second attempt failed quietly, which was worse. Three guests sat in the final stage for
+between 20 and 50 minutes without an error. The host made it look like work was happening:
+`VBoxHeadless` was holding 112% of a CPU. The disk disagreed. The VDI was 3927 MB, and it
+was still 3927 MB seventy-five seconds later, so nothing was being written to it.
+
+![The install spinning without progress in run_unattended_upgrades](screenshots/02-installer-stuck-dist-upgrade.png)
+
+I never pinned that one down conclusively, and
+`troubleshooting/install-autoinstall-failures.md` says so instead of inventing a cause.
+What I did instead was use what the installer had already produced: kernel, bootloader,
+cloud-init and OpenSSH were all on disk. So I powered each guest off, detached both ISO
+images, set the disk as the first boot device and started it again.
+
+```bash
+VBoxManage controlvm nordicshop-lb01 poweroff
+VBoxManage storageattach nordicshop-lb01 --storagectl SATA --port 1 --device 0 \
+  --type dvddrive --medium none
+VBoxManage storageattach nordicshop-lb01 --storagectl SATA --port 2 --device 0 \
+  --type dvddrive --medium none
+VBoxManage modifyvm nordicshop-lb01 --boot1 disk --boot2 none
+VBoxManage startvm nordicshop-lb01 --type headless
+```
+
+That worked on all of them. Both NICs came up with their static addresses, `dpkg --audit`
+printed nothing, and key authentication worked. The same report covers the three other
+provisioning failures: the readiness check that passed before sshd existed, the rejected
+`identity` section, and the autoinstall confirmation prompt that had to be answered by
+injecting keystrokes into the console.
 
 ### The two web nodes
 
@@ -153,6 +230,45 @@ same time, so the reports contain real timelines rather than reconstructions.
 | 3 | Pointed web01's health check at port 8080 | **~2.4 s** after reload | 0 of 60 requests failed, capacity halved |
 | 4 | Stopped the load balancer itself | no detection, **~34 s outage** | 33 of 33 requests failed |
 | 5 | Sent keep-alive traffic through a Layer 4 frontend | n/a | none: 10 of 10 requests pinned to one node |
+
+### The scenario behind each one
+
+The table is the summary. This is what I did, what I saw, and what put it back.
+
+1. **I stopped Nginx on web01.** The client never noticed: 0 of 120 requests failed. The
+   pool noticed in 1.5 seconds with `L4CON` and `check duration: 0ms`, because the kernel
+   refused the connection immediately rather than dropping it. Recovery was
+   `systemctl start nginx` and nothing else, no reload and no config change; HAProxy logged
+   `L7OK/200` and the node was `UP` about a second later. The reason no customer saw an
+   error is `option redispatch`, which retried the 22 requests that had landed on the dead
+   node against web02.
+2. **I blocked lb01 to web01:80 with a ufw rule.** The client did notice this time: 3 of
+   80 requests hung until their own timeout. The pool showed `Layer4 timeout` with
+   `check duration: 2000ms`, so detection stretched to 9.3 seconds instead of 1.5, and the
+   two frontends left web01 in the same state they would after a crash. The fix was
+   `ufw delete deny from 192.168.56.10 to 192.168.56.21 port 80 proto tcp`; the path came
+   back and the balancer found it on its own about 3.5 seconds later, with no HAProxy or
+   Nginx restart.
+3. **I pointed web01's check at port 8080.** Nginx was serving `200` on port 80 the whole
+   time, and `haproxy -c` said the config was valid, but the pool removed the node 2.4
+   seconds after the reload because nothing listened on the port the check used. Customers
+   saw nothing: 0 of 60 samples failed, and capacity simply halved. The fix was to copy the
+   saved config back over `/etc/haproxy/haproxy.cfg` and reload. The node itself was never
+   touched, which was the point: only the observer was wrong.
+4. **I stopped the load balancer.** With no probe able to detect a dead frontend, the
+   client got `000` and curl exit 7 on all 33 requests for about 34 seconds. `systemctl
+   start haproxy` restored service in seconds, but that is a recovery and not a fix, and
+   the report says so. The actual fix is the keepalived and VRRP pair designed in
+   `troubleshooting/incident-04-load-balancer-failure.md`: two balancers, one shared VIP, an
+   election between them. It is designed and not built, because a single client cannot
+   honestly demonstrate an election.
+5. **I forced keep-alive traffic through a Layer 4 frontend.** Same 10 requests that had
+   split 5/5 in `mode http` all went to web01 over one connection, with `sessions=1` and
+   `req_tot` blank, because a Layer 4 balancer chooses per connection and cannot count
+   requests. Nothing failed and no user was affected, which is exactly why it is worth
+   keeping: the dashboard looked healthy while one node did all the work. The fix was to
+   remove the temporary frontend and restore `balance roundrobin`, and the report keeps the
+   decision table for the cases where Layer 4 is the right answer anyway.
 
 ### What each one actually taught me
 
@@ -243,10 +359,10 @@ keep-alive from pinning clients here. I did not know that when I made the decisi
 
 ### Screenshots
 
-`screenshots/` holds real captures only: the provisioning consoles including the
-autoinstall stall and the apt failure, plus the running lab from the section above. The
-browser screenshots were taken with headless Chrome; the console ones are frames of the
-VirtualBox display. Nothing in there was recreated.
+`screenshots/` holds real captures only: a console for each of the four VMs, the
+installer stall, the recovery shell from the apt failure, and the running lab from the
+section above. The browser screenshots were taken with headless Chrome; the console ones
+are frames of the VirtualBox display. Nothing in there was recreated.
 
 ## Rebuilding the lab
 
