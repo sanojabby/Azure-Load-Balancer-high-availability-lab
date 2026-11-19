@@ -1,0 +1,11 @@
+# Local lab secrets and noise. Credentials stay on this machine only.
+.secrets/
+.env
+
+# Capture files and logs produced while testing
+*.pcap
+*.pcapng
+*.log
+
+# macOS
+.DS_Store

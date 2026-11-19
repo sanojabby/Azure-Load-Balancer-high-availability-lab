@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>NordicShop - Web Node 1</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; background: #0f2740; color: #f4f7fb; }
+    main { max-width: 40rem; margin: 4rem auto; padding: 0 1.5rem; }
+    h1 { font-size: 1.9rem; margin-bottom: .25rem; }
+    .tag { display: inline-block; padding: .2rem .6rem; border-radius: 999px;
+           background: #1f6feb; font-size: .8rem; letter-spacing: .05em; }
+    dl { display: grid; grid-template-columns: max-content 1fr; gap: .35rem 1rem;
+         margin-top: 2rem; border-top: 1px solid #2c4a6b; padding-top: 1.5rem; }
+    dt { color: #9db4cd; }
+    code { background: #16324d; padding: .1rem .35rem; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <main>
+    <span class="tag">NODE 1</span>
+    <h1>NordicShop</h1>
+    <p>This page is served by the first web server in the pool.</p>
+    <dl>
+      <dt>Hostname</dt><dd><code>web01</code></dd>
+      <dt>Address</dt><dd><code>192.168.56.21</code></dd>
+      <dt>Health check</dt><dd><code>/healthz</code></dd>
+      <dt>Served by</dt><dd>Nginx, Ubuntu 24.04</dd>
+    </dl>
+  </main>
+</body>
+</html>

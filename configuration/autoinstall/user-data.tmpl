@@ -1,0 +1,69 @@
+#cloud-config
+# ---------------------------------------------------------------------------
+# NordicShop lab autoinstall template
+#
+# Placeholders substituted by scripts/build-seed-iso.sh:
+#   HOSTNAME_SHORT  short hostname, e.g. web01
+#   STATIC_IP       static address on the lab network, e.g. 192.168.56.21
+#   LAB_PASSWORD    lab user password, passed to chpasswd inside the guest
+#   SSH_PUBLIC_KEY  public key allowed to log in as the lab user
+#   INSTANCE_ID     unique cloud-init instance id
+#
+# Two network interfaces, matching architecture/ip-addressing-plan.md:
+#   enp0s3 (NIC1, NAT)       DHCP, provides the only default route
+#   enp0s8 (NIC2, host-only)  static address, no gateway on purpose
+#
+# Note on the password: macOS libcrypt cannot produce a SHA-512 crypt hash, so
+# identity.password carries an MD5 hash purely to satisfy subiquity's schema.
+# The account's real password is set by chpasswd inside the target, where the
+# guest's own PAM stack hashes it properly.
+# ---------------------------------------------------------------------------
+autoinstall:
+  version: 1
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+  timezone: Europe/Stockholm
+  identity:
+    hostname: __HOSTNAME__
+    username: labadmin
+    realname: Lab Admin
+    # Subiquity rejects an identity section without a password, so this hash
+    # exists to satisfy the schema. The real password is set by the chpasswd
+    # late-command below, which lets the guest's PAM stack use a modern hash
+    # instead of the MD5 one macOS openssl can produce.
+    password: "__PASSHASH__"
+  ssh:
+    install-server: true
+    allow-pw: true
+    authorized-keys:
+      - __SSHKEY__
+  network:
+    version: 2
+    ethernets:
+      enp0s3:
+        dhcp4: true
+      enp0s8:
+        dhcp4: false
+        addresses:
+          - __IP__/24
+  storage:
+    layout:
+      name: direct
+  apt:
+    geoip: false
+    preserve_sources_list: false
+  # The installer resolves DNS through systemd-resolved's stub at 127.0.0.53.
+  # That stub is useless inside the target chroot, so curtin's in-target
+  # apt-get update can fail to resolve the archive. Writing a real resolver
+  # before the target is configured avoids that failure.
+  early-commands:
+    - sh -c 'printf "nameserver 10.0.2.3\nnameserver 1.1.1.1\n" > /etc/resolv.conf'
+  late-commands:
+    - curtin in-target -- sh -c 'printf "nameserver 10.0.2.3\nnameserver 1.1.1.1\n" > /etc/resolv.conf'
+    - curtin in-target -- sh -c 'printf "%s:%s\n" "labadmin" "__PASSWORD__" | chpasswd'
+    # Lab convenience: unattended administration of disposable VMs.
+    # Documented as a lab-only trade-off in documentation/phase-2-network.md.
+    - curtin in-target -- sh -c 'printf "%s\n" "labadmin ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/90-lab-nopasswd'
+    - curtin in-target -- chmod 440 /etc/sudoers.d/90-lab-nopasswd
+  shutdown: reboot
