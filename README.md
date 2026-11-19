@@ -94,6 +94,13 @@ Every guest has its own console, and those consoles carried information the host
 give me. Two of them came up cleanly. The other two stalled, and that is the part worth
 showing.
 
+First the host's own view, so the names in the pictures below line up with the machines in
+the lab: four registered VMs, four green arrows. I cropped the window down to the lab
+machines, because the same VirtualBox library holds other work that is not part of this
+project.
+
+![The four NordicShop VMs running in VirtualBox Manager](screenshots/01-virtualbox-manager-four-vms.png)
+
 `lb01` finished cloud-init at 18:19:44, printed the `nordicshop-lab` key it had installed
 for `labadmin`, and dropped to a login prompt.
 
