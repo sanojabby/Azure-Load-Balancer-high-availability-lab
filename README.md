@@ -1,209 +1,205 @@
-# Azure Load Balancer High Availability Lab
+# NordicShop — High Availability & Load Balancing Lab
 
-I built this lab to answer a question I kept running into in AZ-700 material: what does
-a load balancer actually do when a backend fails, and how would I know? Reading about
-health probes and probe thresholds is not the same as watching a pool go from `UP` to
-`DOWN` in a second and a half while a client keeps getting `200`s.
+**A practical case study in load balancing, health monitoring, fault detection, and infrastructure reliability.**
 
-So NordicShop is a small four-VM environment on VirtualBox: one HAProxy load balancer,
-two Nginx backends, one client. I then broke it five different ways on purpose, recorded
-what actually happened with timestamps and counters, and wrote each one up as an incident
-report. Every number in this repository came out of a terminal on the machine, not out of
-a slide.
+NordicShop is an online shop. It used to run on one server, and when that server had a
+bad day, the shop disappeared. I rebuilt that shop as four virtual machines on my own
+laptop, put a load balancer in front of two web servers, and then broke it on purpose five
+times to see exactly what a customer would experience. Everything below is what actually
+happened, in the order it happened, with screenshots from the running lab beside the step
+they belong to.
 
-It is a local simulation of an Azure Load Balancer, NSG and health-probe design, built
-with the closest on-premises equivalents so the failure modes are real rather than
-described.
+I did not deploy anything to Azure. This is the same design built with the closest
+on-premises tools, so the failures are real instead of described. The Azure comparison in
+section 7 is a translation of this lab, not a measurement of the managed service.
 
-## What this is not
+### The words I use, in plain English
 
-- **Not an Azure deployment.** I created no Azure resources and spent nothing. The Azure
-  mapping in `documentation/phase-5-azure-mapping.md` is a translation of this lab into
-  Azure terms, and it says clearly which statements are measured here and which are how
-  the managed service is defined to behave.
-- **Not a production design.** One vCPU and 1 GiB per node, thin disks, a 192.168.56.0/24
-  host-only network. It is sized to be teachable and disposable, not fast.
-- **Not finished.** Keepalived and VRRP are designed in the Incident 4 report but not
-  built, because a four-VM lab with one client cannot honestly demonstrate a VIP
-  election. I would rather say that than pretend.
+| Word | What it means here |
+| --- | --- |
+| Server | A computer that answers requests. Here, a virtual machine running on my laptop. |
+| Load balancer | The front door. It takes every customer request and hands it to a server that is free. |
+| Backend | A server behind the front door. NordicShop has two of them. |
+| Health check | A small test the front door runs every couple of seconds: "are you still able to answer?" |
+| Single point of failure | One part that, if it stops, takes the whole service down with it. |
+| Firewall rule | A rule that says who is allowed to talk to which port on a machine. |
 
-## Architecture
+If you have never worked in IT, the analogy that carries this whole project is a
+supermarket. One checkout till means one queue and one breakdown stops all sales. Two
+tills help, but only if somebody stands at the front and sends each shopper to a free
+one. And that person has to be able to look over and see whether a till is actually open,
+not just switched on.
+
+## 1. The business problem — what was happening at NordicShop?
+
+NordicShop sells online. Customers visit the website, browse products, check prices and
+place orders. At first one web server did all of that, and it was fine while the shop was
+small.
+
+As customer activity grew, the infrastructure started to struggle. During busy periods the
+site was slow. On other occasions it went down completely because the server stopped
+responding. For the business that meant four things:
+
+- Customers could not reach the shop at all.
+- Some of them gave up halfway through a purchase.
+- Sales were lost on days the shop was busiest.
+- The IT team had no second machine to take over when the first one failed.
+
+The infrastructure team was asked to investigate and build something that keeps serving
+customers even when one web server becomes unavailable. That is the job this repository
+documents.
+
+## 2. What I found wrong
+
+The investigation came down to three weaknesses, and they are worth separating because
+each one needs a different fix.
+
+**Problem 1 — the website lived on one server.** If that machine had an operating system
+problem, a service crash or an unexpected shutdown, the site was gone. The root cause was
+simply that there was nothing to fail over to. The fix: a second web server.
+
+**Problem 2 — nothing distributed the traffic.** Buying a second server does not help on
+its own. Customers type one address, and something has to decide which of the two machines
+answers each of them. The root cause was that no component owned that decision. The fix: a
+load balancer in front of both servers.
+
+**Problem 3 — nothing checked whether a server was actually working.** A machine can be
+powered on, fans spinning, while its web service has stopped. Without monitoring, requests
+keep being sent to a server that cannot answer them. The root cause was the absence of any
+continuous check. The fix: health checks, so the front door notices and stops using a
+broken server.
+
+## 3. The design I built
 
 ```
-        Mac host (VirtualBox)
-        LabNet 192.168.56.0/24
+        NordicShop customer
+        client01  192.168.56.31
                  |
-   +-------------+-------------+-------------+
-   |             |             |             |
- client01       lb01         web01         web02
- .31            .10           .21           .22
-              HAProxy        Nginx         Nginx
-              :80 :8404      :80           :80
-                 |             ^             ^
-                 +-------------+-------------+
-                   HTTP health check GET /healthz
+                 v
+        lb01  192.168.56.10        HAProxy, port 80 (and a dashboard on 8404)
+             /        \
+            v          v
+   web01 192.168.56.21   web02 192.168.56.22
+        Nginx :80         Nginx :80
+             \          /
+              GET /healthz, every 2 seconds
 ```
 
-Every guest has two NICs. NIC1 is NAT (`10.0.2.0/24`) and exists only so packages can be
-installed; NIC2 is the host-only lab network and carries all lab traffic with static
-addresses. Only NIC1 has a default route, which means the lab network can never route
-traffic off the host by accident.
+| Component | What it is for |
+| --- | --- |
+| `client01` | Plays the customer. Sends the requests and records what came back. |
+| `lb01` | The front door. Receives every request and picks a backend. |
+| `web01` | First copy of the NordicShop website. |
+| `web02` | Second copy of the NordicShop website. |
 
-### IP plan
+Customers use one address, `http://192.168.56.10`, and never learn that two servers exist
+behind it. HAProxy hands each request to an available server, and if one becomes
+unavailable it sends new requests to the other one.
 
-| Host | Role | Lab address (NIC2) | NAT address (NIC1) | Listening |
-| --- | --- | --- | --- | --- |
-| `lb01` | HAProxy 2.8 frontend + stats | 192.168.56.10 | 10.0.2.15 | 80, 8404 |
-| `web01` | Nginx, node 1 | 192.168.56.21 | 10.0.2.15 | 80 |
-| `web02` | Nginx, node 2 | 192.168.56.22 | 10.0.2.15 | 80 |
-| `client01` | test client | 192.168.56.31 | 10.0.2.15 | none |
-| host `LabNet` | VirtualBox host-only (`bridge100`) | 192.168.56.1 | n/a | n/a |
+All four machines are Ubuntu Server 24.04.5 LTS on VirtualBox 7.2.14, one vCPU, 1024 MB of
+memory and a 20 GB disk each, which is enough to be teachable and small enough to throw
+away. Each machine has two network cards: one that reaches the internet so packages can be
+installed, and one on a private network, `LabNet` on `192.168.56.0/24`, that carries all
+lab traffic on static addresses.
 
-All four guests show the same NAT address because each VM has its own isolated VirtualBox
-NAT network, and `10.0.2.15` is the first address in each of them. That address is only
-used for outbound package installation, so sharing it is harmless, but it does mean it
-identifies nothing: when I look at a log line from `10.0.2.15` I cannot tell which guest
-produced it.
+## 4. Building it, phase by phase
 
-Firewall boundaries, which matter for two of the incidents:
+Each phase below follows the same shape: the business situation, what had to be done, the
+steps, and what I saw when it was done. The screenshots are the real thing, taken from the
+machines at that stage.
 
-- `web01` and `web02` accept port 80 **only from 192.168.56.10**. Nothing else reaches
-  the backends directly, including the client and the host.
-- SSH is allowed from the lab subnet and from `10.0.2.0/24`.
-- HAProxy binds both sockets to `192.168.56.10`, not `0.0.0.0`, so it is not exposed on
-  the NAT interface.
+### Phase 1 — Preparing the infrastructure
 
-### Versions
+**The situation:** NordicShop needs more server capacity, and a separate component that
+manages incoming traffic.
 
-```
-Ubuntu Server 24.04.5 LTS   guest OS, cloud-init autoinstall
-HAProxy 2.8.30              load balancer on lb01
-Nginx 1.24.0                backends
-VirtualBox 7.2.14           host hypervisor, macOS
-```
+**The work:** build the four virtual machines and give them fixed addresses.
 
-## What it looks like
+#### Step 1 — Create the virtual machines
 
-Screenshots of each stage, taken from the running lab. I captured them with headless Chrome
-pointed at `192.168.56.10`, so the browser frame is mine and everything inside it is the
-real pool answering at that moment.
+Four Ubuntu Server guests in VirtualBox: `lb01`, `web01`, `web02` and `client01`. This is
+the host's own view of them, cropped to the lab machines because the same VirtualBox
+library holds other work that has nothing to do with this project.
 
-### The four VMs
+![The four NordicShop virtual machines running in VirtualBox](screenshots/01-virtualbox-manager-four-vms.png)
 
-Every guest has its own console, and those consoles carried information the host could not
-give me. Two of them came up cleanly. The other two stalled, and that is the part worth
-showing.
+#### Step 2 — Give each machine a fixed address
 
-First the host's own view, so the names in the pictures below line up with the machines in
-the lab: four registered VMs, four green arrows. I cropped the window down to the lab
-machines, because the same VirtualBox library holds other work that is not part of this
-project.
+| Machine | Address | Why |
+| --- | --- | --- |
+| `lb01` | 192.168.56.10 | The single address customers use |
+| `web01` | 192.168.56.21 | First backend, must be reachable from `lb01` |
+| `web02` | 192.168.56.22 | Second backend, same reason |
+| `client01` | 192.168.56.31 | Sends the test traffic |
 
-![The four NordicShop VMs running in VirtualBox Manager](screenshots/01-virtualbox-manager-four-vms.png)
+Fixed addresses matter because the balancer has to reach the same two machines every time.
+With DHCP, an address could move to a different machine overnight and the balancer's
+configuration would quietly point at nothing. I set these in netplan, so they survive a
+reboot.
 
-All four are the same size: one vCPU, 1024 MB, a single 20 GB thin disk and two NICs, one
-NAT for package installation and one host-only `LabNet` NIC that carries the lab. What
-differs is the job each one does, so below is each machine on its own, with the panel the
-host shows for it and what that machine actually holds.
+**What each machine actually holds.** The panels below are VirtualBox's details view for
+each guest: name, operating system, memory, disk, network cards and a live console
+preview.
 
-### What each machine holds
-
-#### lb01, the load balancer
+`lb01` is the only machine facing the customer. It has no web content of its own, which is
+the point of Incident 4: when HAProxy stops here, the shop is gone even though both
+backends are perfectly healthy.
 
 ![What lb01 holds, in the VirtualBox details panel](screenshots/01-vm-details-lb01.png)
 
-| What | Value |
-| --- | --- |
-| Job | Takes every customer request and picks a backend. It is the only address the customer uses. |
-| Lab address | `192.168.56.10` on the host-only `LabNet` NIC |
-| Hardware | 1 vCPU, 1024 MB, `nordicshop-lb01.vdi` at 20 GB |
-| Software | HAProxy 2.8.30, listening on `192.168.56.10:80` and `192.168.56.10:8404` |
-| Config | `/etc/haproxy/haproxy.cfg`, beside a timestamped `.bak` left by the last deploy |
-| Logs | `/var/log/haproxy.log`, one line per request with the node that answered it |
-| Firewall | 22 from the lab and NAT; 80 and 8404 from `192.168.56.0/24` only |
-| Not here | No web content of its own. When HAProxy stops, the whole site is gone, which is Incident 4. |
-
-#### web01, node 1
+`web01` serves the shop page and the `/healthz` endpoint the balancer probes. The firewall
+on it accepts port 80 from `192.168.56.10` only, so neither the client nor my Mac can reach
+it directly and skip the balancer. That restriction is what makes Incident 2 possible to
+test honestly.
 
 ![What web01 holds, in the VirtualBox details panel](screenshots/01-vm-details-web01.png)
 
-| What | Value |
-| --- | --- |
-| Job | Nginx backend, serves the shop page and the health endpoint the balancer probes |
-| Lab address | `192.168.56.21` |
-| Hardware | 1 vCPU, 1024 MB, `nordicshop-web01.vdi` at 20 GB |
-| Software | Nginx 1.24.0, listening on `0.0.0.0:80` |
-| Serves | `/var/www/nordicshop/index.html`, which prints NODE 1 and `192.168.56.21`, plus `/healthz` returning `ok web01` |
-| Headers | `X-Web-Node: web01` and `Cache-Control: no-store`, so a cached page cannot pass for a node |
-| Firewall | 80 from `192.168.56.10` only, so neither the client nor this Mac can reach it directly |
-| Not here | No database, no session store. The node is deliberately stateless so either one can answer. |
-
-#### web02, node 2
+`web02` is identical in every way that matters to a request. It prints NODE 2 instead of
+NODE 1, and that difference is how a screenshot can prove which machine answered.
 
 ![What web02 holds, in the VirtualBox details panel](screenshots/01-vm-details-web02.png)
 
-| What | Value |
-| --- | --- |
-| Job | The second backend, identical in every way that matters to a request |
-| Lab address | `192.168.56.22` |
-| Hardware | 1 vCPU, 1024 MB, `nordicshop-web02.vdi` at 20 GB |
-| Software | Nginx 1.24.0, listening on `0.0.0.0:80` |
-| Serves | The same page with NODE 2 and `192.168.56.22`, and `/healthz` returning `ok web02` |
-| Headers | `X-Web-Node: web02`, `Cache-Control: no-store` |
-| Firewall | 80 from `192.168.56.10` only |
-| Not here | Nothing distinct from web01. That is the point: the page tells you which node answered, and nothing else does. |
-
-#### client01, the customer
+`client01` is the customer's view. It runs nothing but SSH, `curl` and `jq`, so every
+result in this repository is a client result and not something measured from inside the
+infrastructure.
 
 ![What client01 holds, in the VirtualBox details panel](screenshots/01-vm-details-client01.png)
 
-| What | Value |
-| --- | --- |
-| Job | Sends the traffic and records what came back. In every incident this is the customer's view. |
-| Lab address | `192.168.56.31` |
-| Hardware | 1 vCPU, 1024 MB, `nordicshop-client01.vdi` at 20 GB |
-| Software | `curl` and `jq`; the samplers in `scripts/` run from this Mac over SSH |
-| Listening | SSH only. There is no web server on it |
-| Firewall | 22 from the lab and NAT |
-| Not here | No content and no state. If this machine is the only one that fails, nothing about the service changes. |
+#### Step 3 — Install the operating system
 
-### The consoles at install time
+I provisioned the guests with a cloud-init seed so each install was identical. Two came up
+cleanly and dropped to a login prompt.
 
-The details panels say what each machine was given. The consoles say what it did with it.
-
-`lb01` finished cloud-init at 18:19:44, installed the `nordicshop-lab` key for `labadmin`
-and dropped to a login prompt.
+`lb01` finished at 18:19:44 and landed on its own hostname, which is how I knew the
+installer had used the identity I gave it:
 
 ![lb01 console after a complete autoinstall](screenshots/02-installer-console-lb01.png)
 
-`client01` did the same at 18:38:06. That `client01 login:` line is how I confirmed the
-guest had come up with the hostname I asked for, rather than with something the installer
-made up.
+`client01` did the same at 18:38:06:
 
 ![client01 console after a complete autoinstall](screenshots/02-installer-console-client01.png)
 
-`web01` and `web02` never got that far on the first attempt. Both stopped on the same line,
-`run_unattended_upgrades`, which runs `apt-get dist-upgrade` inside the target system and
-prints nothing while it runs.
+`web01` and `web02` did not. Both stopped on the same line, `run_unattended_upgrades`,
+which runs `apt-get dist-upgrade` inside the new system and prints nothing at all while it
+runs, so a stuck install looks exactly like a slow one.
 
 ![web01 installer sitting in run_unattended_upgrades](screenshots/02-installer-console-web01.png)
 
 ![web02 installer sitting in run_unattended_upgrades](screenshots/02-installer-console-web02.png)
 
-### How the installs failed, and how I got past them
+#### What went wrong installing, and how I got past it
 
-This is the part of the build that cost me the most time, so it goes in the order it
-happened.
+This cost me the most time in the whole build, so it stays in the order it happened.
 
-The first attempt failed loudly. The installer worked through network, mirror and locale,
-then stopped with:
+The first attempt failed loudly: the installer worked through network, mirror and locale,
+then stopped with
 
 ```
 curtin command in-target returned non-zero exit status 1
 An error occurred. Press enter to start a shell
 ```
 
-I took that shell and checked the obvious thing first: the network. The archive answered a
+I took the shell and checked the obvious thing first, the network. The archive answered a
 ping in 37 ms, so connectivity was never the problem. What the shell did show was that
 `/etc/resolv.conf` named no server, and that `/target` had already been torn down, so the
 failing `apt-get update` could not be re-run to read its own error.
@@ -211,10 +207,9 @@ failing `apt-get update` could not be re-run to read its own error.
 ![The installer recovery shell after curtin exited 1](screenshots/troubleshooting-apt-failure.png)
 
 The cause was the resolver. The installer resolves through systemd-resolved's stub on
-`127.0.0.53`, and inside the target chroot during `curtin in-target` there is nothing
-behind that stub, so apt could not resolve the archive even though the installer
-environment could. The fix was to write a real resolver before the target gets configured,
-so curtin copies a working one into the chroot:
+`127.0.0.53`, and inside the target chroot there is nothing behind that stub, so apt could
+not resolve the archive even though the installer environment could. The fix was to write a
+real resolver before the target gets configured, so curtin copies a working one in:
 
 ```yaml
 early-commands:
@@ -225,7 +220,7 @@ early-commands:
 and curtin moved on to packages, kernel and bootloader.
 
 The second attempt failed quietly, which was worse. Three guests sat in the final stage for
-between 20 and 50 minutes without an error. The host made it look like work was happening:
+between 20 and 50 minutes with no error, and the host made it look like work was happening:
 `VBoxHeadless` was holding 112% of a CPU. The disk disagreed. The VDI was 3927 MB, and it
 was still 3927 MB seventy-five seconds later, so nothing was being written to it.
 
@@ -235,7 +230,7 @@ I never pinned that one down conclusively, and
 `troubleshooting/install-autoinstall-failures.md` says so instead of inventing a cause.
 What I did instead was use what the installer had already produced: kernel, bootloader,
 cloud-init and OpenSSH were all on disk. So I powered each guest off, detached both ISO
-images, set the disk as the first boot device and started it again.
+images, made the disk the first boot device and started it again.
 
 ```bash
 VBoxManage controlvm nordicshop-lb01 poweroff
@@ -247,17 +242,149 @@ VBoxManage modifyvm nordicshop-lb01 --boot1 disk --boot2 none
 VBoxManage startvm nordicshop-lb01 --type headless
 ```
 
-That worked on all of them. Both NICs came up with their static addresses, `dpkg --audit`
-printed nothing, and key authentication worked. The same report covers the three other
-provisioning failures: the readiness check that passed before sshd existed, the rejected
-`identity` section, and the autoinstall confirmation prompt that had to be answered by
-injecting keystrokes into the console.
+That worked on all of them. Both network cards came up with their static addresses,
+`dpkg --audit` printed nothing, and key authentication worked.
 
-### The two web nodes
+**What this phase produced:** four virtual machines that boot, hold their addresses and can
+reach each other on the lab network.
 
-Both backends serve the same page with the node identity baked into it, so any screenshot
-says which one answered. These are two separate requests through the balancer, one
-round-robin step apart.
+### Phase 2 — Putting the shop on two servers
+
+**The situation:** the shop still depends on one server. If that one fails, customers lose
+access.
+
+**The work:** install Nginx on both web servers and give each one a page that says which
+machine answered.
+
+#### Step 1 — Install Nginx on both machines
+
+```bash
+sudo apt update
+sudo apt install nginx -y
+sudo systemctl enable --now nginx
+```
+
+`enable --now` matters more than it looks. It starts Nginx and also makes sure it comes
+back after a reboot, which is the difference between a lab that survives the night and one
+that quietly dies.
+
+#### Step 2 — Give each server its own identity
+
+Both machines serve the same shop page, with the node name and address baked into it:
+
+```
+Welcome to NordicShop
+Your online shopping destination.
+Request handled by: WEB01
+Server IP: 192.168.56.21
+```
+
+`web02` serves the same text with NODE 2 and `192.168.56.22`. Each response also carries
+`X-Web-Node: web01|web02` and `Cache-Control: no-store`, so a cached page can never be
+mistaken for proof that a particular machine answered. Without that identity, two servers
+behind a balancer look like one server, and you cannot tell whether the balancer is doing
+anything at all.
+
+#### Step 3 — Add an endpoint the balancer can test
+
+Both servers answer `/healthz` with `ok web01` or `ok web02`. That endpoint is deliberately
+tiny: it returns nothing from disk and does no database work, so if it answers, the web
+server itself is alive. A health endpoint that depends on three other systems tells you
+about those systems, not about the machine you are testing.
+
+#### Step 4 — Prove both servers answer on their own
+
+From another machine on the lab network:
+
+```bash
+curl http://192.168.56.21
+curl http://192.168.56.22
+curl http://192.168.56.21/healthz
+curl http://192.168.56.22/healthz
+```
+
+Both pages came back, each naming its own machine, and both health endpoints answered.
+
+#### Step 5 — Check the firewall boundary in both directions
+
+`web01` and `web02` accept port 80 only from `192.168.56.10`. The point is to make sure
+customers really do go through the front door and cannot walk around it. When I tested the
+blocked direction from the client, the connection timed out at 5.00 s rather than being
+refused, which is what a DROP rule looks like: silence, not a rejection.
+
+### Phase 3 — Adding the load balancer
+
+**The situation:** two working web servers, and still nothing to decide which one answers.
+
+**The work:** install HAProxy on `lb01` and put both servers in a pool behind it.
+
+#### Step 1 — Install it
+
+```bash
+sudo apt update
+sudo apt install haproxy -y
+```
+
+#### Step 2 — Open the front door
+
+HAProxy listens on `192.168.56.10:80`, and only there. It is not bound to `0.0.0.0`,
+because the NAT interface exists for package downloads and has no business accepting
+customer traffic. This single address is now the whole shop as far as the outside world is
+concerned.
+
+#### Step 3 — Build the pool
+
+Both backends go into one backend block, `nordicshop_web`:
+
+- `web01` at `192.168.56.21:80`
+- `web02` at `192.168.56.22:80`
+
+Distribution is `balance roundrobin`, so requests take turns. The mode is `http` rather
+than `tcp` because HTTP mode can ask for `/healthz` and check for a `200`, instead of only
+proving that something accepts a connection. That choice later turned out to prevent
+keep-alive from pinning one customer to one server, which is Incident 5.
+
+#### Step 4 — Teach it what "working" means
+
+`option httpchk GET /healthz` plus `check` on each server line. Every two seconds HAProxy
+asks both machines the same question. A server that fails the check is marked DOWN and
+stops receiving new requests. `option redispatch` is also on, which lets HAProxy retry a
+request that landed on a server which just died against the other one.
+
+#### Step 5 — Validate before trusting it
+
+```bash
+sudo haproxy -c -f /etc/haproxy/haproxy.cfg
+```
+
+A valid config only means the file parses. Incident 3 exists because a valid configuration
+can still describe a machine that is not there, so the real check is the dashboard:
+
+![HAProxy statistics page with both backends up](screenshots/04-lb-stats-healthy.png)
+
+Both servers green, `Status UP`, `LastChk L7OK/200`, equal weight on `nordicshop_web`. On
+port 8404 HAProxy serves its own statistics page, which became the window I watched during
+every incident. That bottom line is the state I expect before I break anything.
+
+### Phase 4 — Checking it from the customer's side
+
+**The situation:** the new infrastructure exists. Before anyone relies on it, it has to be
+shown working from where the customer stands.
+
+The customer only ever runs one command:
+
+```bash
+curl http://192.168.56.10
+```
+
+Then the same thing ten times over, to see whether both machines are really taking a share:
+
+```bash
+for i in {1..10}; do curl -s http://192.168.56.10 | grep 'Server IP'; done
+```
+
+Two separate requests through the balancer, one round-robin step apart, land on different
+machines:
 
 ![NordicShop page served by web01](screenshots/03-web-tier-web01.png)
 
@@ -265,298 +392,401 @@ round-robin step apart.
 
 ![NordicShop page served by web02](screenshots/03-web-tier-web02.png)
 
-`NODE 2`, `web02`, `192.168.56.22`. Same URL, different server, and the client never chose.
+`NODE 2`, `web02`, `192.168.56.22`.
 
-### The load balancer's view of the pool
+Same URL, different server, and the client never chose. A run of twenty requests split
+10/10, both servers `UP`, `check=L7OK`, `code=200`.
 
-HAProxy's stats page on port 8404 is the closest thing this lab has to a dashboard, and it
-is what I watched during every incident.
+## 5. Incidents — what happens when it breaks
 
-![HAProxy statistics page with both backends up](screenshots/04-lb-stats-healthy.png)
+Building something that works is the easy half. The useful half is knowing how it behaves
+when a part fails. So I ran five controlled failures, each with samplers recording the
+customer's view and the pool's view at the same moment, and wrote each one up in the same
+shape:
 
-Both servers green, `Status UP`, `LastChk L7OK/200`, equal weight on `nordicshop_web`.
-That bottom line is the state I expect to see before I break anything.
+1. **Incident** — what happened to NordicShop?
+2. **Investigation** — what caused it?
+3. **Action** — how did I reproduce or fix it?
+4. **Result** — how did the infrastructure respond?
+5. **Lesson** — what does this mean for reliability?
 
-### A failure, caught while it was happening
+| # | What I broke | Detection | Customer impact |
+| --- | --- | --- | --- |
+| 1 | Stopped Nginx on `web01` | **~1.5 s** | 0 of 120 requests failed (98 to web02, 22 to web01) |
+| 2 | Blocked `lb01` to `web01:80` with a firewall rule | **~9.3 s** | 3 of 80 requests failed |
+| 3 | Pointed `web01`'s health check at port 8080 | **~2.4 s** after reload | 0 of 60 requests failed, capacity halved |
+| 4 | Stopped the load balancer itself | no detection, **~34 s outage** | 33 of 33 requests failed |
+| 5 | Sent keep-alive traffic through a Layer 4 frontend | n/a | none: 10 of 10 requests pinned to one node |
 
-I re-ran Incident 1 for this image: stopped Nginx on web01, waited three seconds, captured
-the stats page, then started Nginx again.
+### Incident 1 — WEB01 stops responding
+
+**Incident.** `web01` suddenly stopped answering HTTP requests. Customers were still
+visiting the shop, but the first backend could no longer process anything.
+
+**Investigation.** The Nginx service on `web01` had been stopped. The question I wanted
+answered was whether HAProxy would notice and move traffic to `web02` with no help from me.
+
+**Action.**
+
+```bash
+sudo systemctl stop nginx
+```
+
+while the client kept sending requests through the balancer.
+
+**Result.** HAProxy detected the failure and marked `web01` DOWN. New traffic went to
+`web02`. Customers continued to shop.
+
+| Measurement | Result |
+| --- | --- |
+| Detection time | about 1.5 seconds |
+| Total requests | 120 |
+| Failed requests | 0 |
+| Served by web01 | 22 |
+| Served by web02 | 98 |
+
+This is the one failure I caught in a screenshot while it was happening. I stopped Nginx,
+waited three seconds, captured the stats page, then started it again:
 
 ![HAProxy statistics page with web01 down](screenshots/05-incident1-web01-down.png)
 
 `web01` is red with `L4CON in 2ms`, a downtime timer of three seconds and a growing queue;
 `web02` is untouched and still `UP`. The frontend row stays `OPEN` throughout, which is the
-whole point of the incident: the pool lost half its capacity and the customer saw `200`s.
+whole point: the pool lost half its capacity and the customer saw `200`s.
 
-### What is not screenshotted
-
-Incidents 2, 3 and 5, and the total outage in Incident 4, are recorded as measured terminal
-output in their reports. For Incident 4 I tried to capture the browser's connection error
-and could not: headless Chrome exits cleanly on a failed navigation without writing an
-image. Rather than fake that frame, the outage stays a table of 33 failed requests.
-
-## The five incidents
-
-Each one was run with samplers capturing the client's view and the pool's view at the
-same time, so the reports contain real timelines rather than reconstructions.
-
-| # | What I broke | Detection | Customer impact |
-| --- | --- | --- | --- |
-| 1 | Stopped Nginx on web01 | **~1.5 s** | 0 of 120 requests failed (98 to web02, 22 to web01) |
-| 2 | Blocked lb01 to web01:80 with a firewall rule | **~9.3 s** | 3 of 80 requests failed |
-| 3 | Pointed web01's health check at port 8080 | **~2.4 s** after reload | 0 of 60 requests failed, capacity halved |
-| 4 | Stopped the load balancer itself | no detection, **~34 s outage** | 33 of 33 requests failed |
-| 5 | Sent keep-alive traffic through a Layer 4 frontend | n/a | none: 10 of 10 requests pinned to one node |
-
-### The scenario behind each one
-
-The table is the summary. This is what I did, what I saw, and what put it back.
-
-1. **I stopped Nginx on web01.** The client never noticed: 0 of 120 requests failed. The
-   pool noticed in 1.5 seconds with `L4CON` and `check duration: 0ms`, because the kernel
-   refused the connection immediately rather than dropping it. Recovery was
-   `systemctl start nginx` and nothing else, no reload and no config change; HAProxy logged
-   `L7OK/200` and the node was `UP` about a second later. The reason no customer saw an
-   error is `option redispatch`, which retried the 22 requests that had landed on the dead
-   node against web02.
-2. **I blocked lb01 to web01:80 with a ufw rule.** The client did notice this time: 3 of
-   80 requests hung until their own timeout. The pool showed `Layer4 timeout` with
-   `check duration: 2000ms`, so detection stretched to 9.3 seconds instead of 1.5, and the
-   two frontends left web01 in the same state they would after a crash. The fix was
-   `ufw delete deny from 192.168.56.10 to 192.168.56.21 port 80 proto tcp`; the path came
-   back and the balancer found it on its own about 3.5 seconds later, with no HAProxy or
-   Nginx restart.
-3. **I pointed web01's check at port 8080.** Nginx was serving `200` on port 80 the whole
-   time, and `haproxy -c` said the config was valid, but the pool removed the node 2.4
-   seconds after the reload because nothing listened on the port the check used. Customers
-   saw nothing: 0 of 60 samples failed, and capacity simply halved. The fix was to copy the
-   saved config back over `/etc/haproxy/haproxy.cfg` and reload. The node itself was never
-   touched, which was the point: only the observer was wrong.
-4. **I stopped the load balancer.** With no probe able to detect a dead frontend, the
-   client got `000` and curl exit 7 on all 33 requests for about 34 seconds. `systemctl
-   start haproxy` restored service in seconds, but that is a recovery and not a fix, and
-   the report says so. The actual fix is the keepalived and VRRP pair designed in
-   `troubleshooting/incident-04-load-balancer-failure.md`: two balancers, one shared VIP, an
-   election between them. It is designed and not built, because a single client cannot
-   honestly demonstrate an election.
-5. **I forced keep-alive traffic through a Layer 4 frontend.** Same 10 requests that had
-   split 5/5 in `mode http` all went to web01 over one connection, with `sessions=1` and
-   `req_tot` blank, because a Layer 4 balancer chooses per connection and cannot count
-   requests. Nothing failed and no user was affected, which is exactly why it is worth
-   keeping: the dashboard looked healthy while one node did all the work. The fix was to
-   remove the temporary frontend and restore `balance roundrobin`, and the report keeps the
-   decision table for the cases where Layer 4 is the right answer anyway.
-
-### What each one actually taught me
-
-1. **A stopped process fails fast and gets masked.** HAProxy logged `Connection refused`
-   with `check duration: 0ms` and logged the server DOWN at 1.5 seconds. Every client
-   request still got a `200` because `option redispatch` retried in flight: 22 requests
-   that were assigned to the dead node came back from web02. That means a monitoring
-   system watching HTTP status codes would have missed the whole incident.
-2. **A dropped packet looks nothing like a refused one.** With the firewall dropping
-   traffic, the check reported `Layer4 timeout` and `check duration: 2000ms`, detection
-   stretched to 9.3 seconds, and customers saw three requests hang until their own
-   timeout. Same pool state, completely different fingerprint.
-3. **The balancer's opinion is not the backend's health.** A healthy Nginx, reachable on
-   port 80 from the balancer, returning `200` locally, was removed from the pool in 2.4
-   seconds because the check was aimed at port 8080. `haproxy -c` had already said
-   `Configuration file is valid`. Configuration validation is not behavioural validation.
-4. **Redundancy has to reach the edge.** Two healthy backends, an idle balancer, and a
-   totally dead site: `000` and curl exit 7 on every request for 34 seconds. The backends
-   answered `200` throughout, from the balancer's host and from themselves. All the
-   availability work sat below the one component that had none.
-5. **Even distribution is a property of the balancing key.** In HTTP mode the lab
-   balances per request, and keep-alive did not pin anything: 1 connection, 10 requests,
-   5/5. Forcing a Layer 4 frontend pinned all 10 requests to web01, with
-   `sessions=1` and `req_tot` blank. `balance source` split three clients 16 to 10
-   sessions by hashing two of them to the same node. Connection counts and request counts
-   are different quantities, and which one you watch decides whether you notice.
-
-The fifth one also produced the most useful surprise: I chose `mode http` in Phase 4 only
-so the health check could request `/healthz`, and that choice happens to be what prevents
-keep-alive from pinning clients here. I did not know that when I made the decision.
-
-## Repository map
-
-### Documentation
-
-| File | Contents |
-| --- | --- |
-| `documentation/phase-1-environment-assessment.md` | Host capacity, VirtualBox and VT-x checks, VM sizing and why |
-| `documentation/phase-2-network.md` | VM creation, cloud-init provisioning, static addressing, ping matrix |
-| `documentation/phase-3-web-tier.md` | Nginx deployment, distinct node identity, firewall boundary proven both ways |
-| `documentation/phase-4-load-balancer.md` | HAProxy config, health checks, algorithm choice, distribution evidence |
-| `documentation/phase-5-azure-mapping.md` | The lab translated into Azure LB, NSG and probe terms, incident by incident |
-
-### Architecture
-
-| File | Contents |
-| --- | --- |
-| `architecture/architecture-diagram.md` | Traffic paths, failure domains, what is redundant and what is not |
-| `architecture/ip-addressing-plan.md` | Full address plan, netplan config, port table, Azure overlay |
-
-### Incident reports
-
-| File | Incident |
-| --- | --- |
-| `troubleshooting/incident-01-backend-failure.md` | Backend process stopped: fast failure, redispatch, 1.5 s |
-| `troubleshooting/incident-02-network-failure.md` | Path blocked by firewall: silent drop, 9.3 s, customer timeouts |
-| `troubleshooting/incident-03-health-check-port.md` | Wrong probe port: healthy node removed, 2.4 s |
-| `troubleshooting/incident-04-load-balancer-failure.md` | Balancer stopped: total outage, keepalived/VRRP design, Azure comparison |
-| `troubleshooting/incident-05-uneven-distribution.md` | Keep-alive pinning, `balance source`, why counters disagree |
-| `troubleshooting/install-autoinstall-failures.md` | Five provisioning failures and how I fixed each one |
-
-### Configuration (what actually runs)
-
-| Path | Contents |
-| --- | --- |
-| `configuration/haproxy/haproxy.cfg` | Frontend, backend, probe, timeouts, stats listener |
-| `configuration/nginx/web01-site.conf`, `web01-index.html` | Node 1 server block and page |
-| `configuration/nginx/web02-site.conf`, `web02-index.html` | Node 2 server block and page |
-| `configuration/autoinstall/user-data.tmpl`, `meta-data.tmpl` | cloud-init NoCloud templates |
-
-### Scripts
-
-| Script | Purpose |
-| --- | --- |
-| `scripts/rebuild-lab-vms.sh` | Create the four VMs. Prints the plan unless `CONFIRM=yes`; `BACKUP=yes` keeps the old folders |
-| `scripts/install-guest.sh <host> <ip>` | Build the seed ISO, attach both ISOs, run the autoinstall, wait for SSH |
-| `scripts/build-seed-iso.sh <host> <ip>` | Standalone seed ISO builder (`/tmp/nordicshop-seed-<host>.iso`) |
-| `scripts/finish-guest.sh <host> <ip>` | Eject media, boot from disk, verify the guest answers with its hostname |
-| `scripts/guest.sh <host> [--root] "<cmd>"` | SSH wrapper; base64-encodes the remote command, feeds sudo over stdin |
-| `scripts/deploy-nginx.sh <host>` | Install the site config and page from `configuration/nginx/` |
-| `scripts/deploy-haproxy.sh` | Validate then deploy `haproxy.cfg`, keeping a timestamped backup |
-| `scripts/verify-web-tier.sh` | Prove the backend firewall boundary in both directions |
-| `scripts/verify-load-balancing.sh [n]` | Send `n` requests and count which node answered, plus pool state |
-| `scripts/probe-frontend.sh [n] [interval]` | Client-side sampler used during incidents |
-| `scripts/watch-pool.sh [n] [interval] [server]` | Pool-state sampler |
-| `scripts/watch-pool-timeline.sh` | Pool sampler that survives a reload or crash |
-| `scripts/pool-counters.sh [pxname]` | Sessions vs requests per server, columns resolved by name |
-
-### Screenshots
-
-`screenshots/` holds real captures only: a console for each of the four VMs, the
-installer stall, the recovery shell from the apt failure, and the running lab from the
-section above. The browser screenshots were taken with headless Chrome; the console ones
-are frames of the VirtualBox display. Nothing in there was recreated.
-
-## Rebuilding the lab
-
-### Prerequisites
-
-- VirtualBox 7.x on the host, with a host-only network named `LabNet` on
-  `192.168.56.0/24` (this lab reuses an existing one; it does not create or modify host
-  networks)
-- Ubuntu Server 24.04 live ISO, by default expected at
-  `~/Downloads/ubuntu-24.04.5-live-server-amd64.iso` (override with `ISO=`)
-- About 4 GB RAM and 80 GB disk free for the four VMs
-- `.secrets/` containing the lab account details and SSH key. It is gitignored and
-  deliberately not in this repository:
-
-```
-.secrets/lab.env        LAB_USER=labadmin, LAB_PASS_FILE=...
-.secrets/lab.pass       the account password
-.secrets/lab_ed25519    private key
-.secrets/lab_ed25519.pub
-```
-
-### Steps
+**Recovery.**
 
 ```bash
-# 1. create the four VMs (destructive: prints a plan first)
-./scripts/rebuild-lab-vms.sh
-CONFIRM=yes BACKUP=yes ./scripts/rebuild-lab-vms.sh
-
-# 2. install each guest from the cloud-init seed, one at a time
-./scripts/install-guest.sh lb01     192.168.56.10
-./scripts/install-guest.sh web01    192.168.56.21
-./scripts/install-guest.sh web02    192.168.56.22
-./scripts/install-guest.sh client01 192.168.56.31
-
-# 3. switch each guest from installer boot to disk boot and verify it
-./scripts/finish-guest.sh lb01     192.168.56.10
-./scripts/finish-guest.sh web01    192.168.56.21
-./scripts/finish-guest.sh web02    192.168.56.22
-./scripts/finish-guest.sh client01 192.168.56.31
-
-# 4. deploy the tiers
-./scripts/deploy-nginx.sh web01
-./scripts/deploy-nginx.sh web02
-./scripts/deploy-haproxy.sh
-
-# 5. verify: firewall boundary, then distribution
-./scripts/verify-web-tier.sh
-./scripts/verify-load-balancing.sh 20
+sudo systemctl start nginx
 ```
 
-Expected result of step 5: the firewall matrix passes in both directions (denials time
-out at 5.00 s, which is a DROP rather than a refusal), and the 20 requests split 10/10
-with both servers `UP`, `check=L7OK`, `code=200`.
+No reload, no config change. HAProxy logged `L7OK/200` and the node was `UP` about a second
+later. The reason no customer saw an error is `option redispatch`: the 22 requests that had
+been assigned to the dead node were retried against `web02`.
 
-The provisioning path has real failure modes, all documented in
-`troubleshooting/install-autoinstall-failures.md`: the unattended installer spinning in
-`run_unattended_upgrades`, the "Continue with autoinstall?" prompt that has to be answered
-on the console, `policy-rc.d` leaving services installed but inactive, and `nc -z`
-reporting success against VirtualBox's NAT forward with no guest behind it.
+**Lesson.** A backend failure does not have to become a website outage when another healthy
+server is available and the balancer is configured to use it. It also taught me that a
+monitoring system watching HTTP status codes would have missed this incident completely,
+because every response was a `200`.
 
-## Azure: what the managed service removes, and what it does not
+### Incident 2 — LB01 cannot talk to WEB01
 
-This is the part I would actually use in a design review.
+**Incident.** `web01` was running fine, but NordicShop's balancer could no longer reach it.
 
-**Azure removes:**
+**Investigation.** A firewall rule was blocking HTTP between the two machines. I wanted to
+know whether the symptom was the web server or the path to it, because those look the same
+from the outside.
 
-1. The load balancer as a single point of failure. No VM to stop, no keepalived to build,
-   zone-redundant frontend, 99.99% SLA on Standard SKU.
+**Action.** I added a `ufw` rule on `web01` denying port 80 from `192.168.56.10`, then
+watched the health checks and kept sending customer requests.
+
+**Result.** `web01` stayed up and Nginx kept serving locally. HAProxy could not reach it,
+the checks failed, and the node was eventually marked DOWN. Some customers were affected
+while detection was in progress.
+
+| Measurement | Result |
+| --- | --- |
+| Detection time | about 9.3 seconds |
+| Total requests | 80 |
+| Failed requests | 3 |
+| Health-check result | Layer 4 timeout |
+
+**Recovery.** Remove the rule:
+
+```bash
+sudo ufw delete deny from 192.168.56.10 to 192.168.56.21 port 80 proto tcp
+```
+
+The path came back and HAProxy found it on its own about 3.5 seconds later, with no HAProxy
+or Nginx restart.
+
+**Lesson.** A server can be perfectly healthy and still unavailable to an application,
+because of the network between them. Dropped packets also look nothing like a refused
+connection: the same pool state, but detection took 9.3 seconds instead of 1.5, and
+customers saw three requests hang until their own timeout.
+
+### Incident 3 — A healthy server reported as unavailable
+
+**Incident.** `web01` was working correctly, and HAProxy insisted it was down.
+
+**Investigation.** The health check was aimed at port 8080. Nginx listens on 80.
+
+**Action.** I pointed `web01`'s check at 8080, reloaded, and watched the dashboard.
+
+**Result.** Nginx kept serving `200` on port 80. Health checks failed, `web01` went DOWN,
+and customer requests continued through `web02` without an error.
+
+| Measurement | Result |
+| --- | --- |
+| Detection time | about 2.4 seconds after reload |
+| Total requests | 60 |
+| Failed requests | 0 |
+| Backend capacity | halved |
+
+**Recovery.** Put the correct configuration back and reload:
+
+```bash
+sudo cp /tmp/inc3-good.cfg /etc/haproxy/haproxy.cfg
+sudo systemctl reload haproxy
+```
+
+The web server itself never needed restarting, which was the point: only the observer was
+wrong.
+
+**Lesson.** Monitoring is only useful when it is configured correctly. `haproxy -c` had
+already said the file was valid, and it was: a valid configuration can still describe a
+machine that does not exist. Configuration validation is not behavioural validation.
+
+### Incident 4 — The load balancer stops
+
+**Incident.** Customers could no longer reach the shop at its normal address.
+
+**Investigation.** The HAProxy service on `lb01` had been stopped. Both backends were
+perfectly healthy, and it made no difference at all.
+
+**Action.**
+
+```bash
+sudo systemctl stop haproxy
+```
+
+with the client still sending requests.
+
+**Result.** `web01` and `web02` stayed healthy. `lb01` stopped accepting requests. Every
+single test request failed.
+
+| Measurement | Result |
+| --- | --- |
+| Total requests | 33 |
+| Failed requests | 33 |
+| Outage duration | about 34 seconds |
+| Backend servers | both healthy |
+| Load balancer | unavailable |
+
+I tried to capture the browser's connection error and could not: headless Chrome exits
+cleanly on a failed navigation without writing an image. Rather than fake that frame, the
+outage stays a table of 33 failed requests.
+
+**Recovery.** Start it again:
+
+```bash
+sudo systemctl start haproxy
+```
+
+That restores service in seconds, but a recovery is not a fix, and the report says so.
+
+**What would actually fix it.** Two load balancers and one shared virtual address, with
+keepalived and VRRP electing which one is active. That design is written up in
+`troubleshooting/incident-04-load-balancer-failure.md` and it was **not built**. A
+four-VM lab with a single client cannot honestly demonstrate an election, and I would
+rather say that than pretend otherwise.
+
+**Lesson.** Backend redundancy is not high availability. All of the availability work in
+this lab sat below the one component that had none.
+
+### Incident 5 — Uneven traffic distribution
+
+**Incident.** During one of the tests the two backends did not receive the share of traffic
+I expected.
+
+**Investigation.** Connection-level balancing in Layer 4 behaves differently from
+request-level balancing. I compared them with the same client and the same load.
+
+**Action.** I ran ten requests through the HTTP frontend, then ten through a temporary
+`mode tcp` frontend, keeping the connection alive.
+
+**Result.**
+
+| Measurement | Result |
+| --- | --- |
+| Total requests | 10 |
+| HTTP-mode distribution | 5 and 5 |
+| Layer 4 distribution | 10 and 0 |
+| Customer errors | 0 |
+
+The Layer 4 run put all ten requests on `web01` because they shared one persistent
+connection, and a Layer 4 balancer chooses per connection. The counters said so: `sessions=1`
+and `req_tot` blank, because it cannot count requests it never looks inside.
+
+**Recovery.** Remove the temporary frontend and restore `balance roundrobin`:
+
+```bash
+sudo cp /tmp/inc5-base.cfg /etc/haproxy/haproxy.cfg && sudo systemctl reload haproxy
+```
+
+**Lesson.** Traffic distribution depends on the balancing method and on how clients
+connect. Two backend servers do not guarantee an equal workload. The dashboard looked
+perfectly healthy while one node did all the work, which is the kind of thing that only
+shows up when you compare session counts against request counts.
+
+### What the five incidents have in common
+
+The same broken service produced five completely different fingerprints. A stopped process
+failed in 1.5 seconds and was masked from customers. A dropped packet took 9.3 seconds and
+was not. A wrong port removed a healthy node in 2.4 seconds while the config passed every
+check. A dead balancer produced a total outage with two perfectly good servers behind it.
+And a healthy pair of servers can still do wildly unequal work depending on how you count.
+
+## 6. What the project demonstrated
+
+| Original problem | Implemented solution or finding |
+| --- | --- |
+| Single backend server | Two Nginx web servers |
+| No traffic distribution | HAProxy load balancer |
+| No automatic backend health detection | HTTP health checks on `/healthz` |
+| Backend server failure | New traffic redirected to a healthy backend |
+| Network connectivity failure | Detection through health checks |
+| Load balancer as a single point of failure | Identified; secondary load balancer design documented |
+| Uneven traffic distribution | Compared Layer 4 and HTTP balancing behaviour |
+
+## 7. How this relates to Microsoft Azure
+
+I built this locally, but the concepts are the ones that show up in Azure networking, and
+this mapping is what I would carry into a design review.
+
+| Local component | Azure concept |
+| --- | --- |
+| HAProxy | Azure Load Balancer (similar traffic-distribution role) |
+| Nginx on `web01` and `web02` | Backend pool virtual machines |
+| `/healthz` endpoint | Load balancer health probe |
+| UFW firewall rules | Network Security Group rules |
+| HAProxy frontend address | Load balancer frontend IP |
+| Two backends | Redundant backend infrastructure |
+
+This is a conceptual mapping, not a claim that the two behave identically. Azure Load
+Balancer is a managed service, and none of the timings here are Azure performance numbers.
+
+**What Azure removes for you:**
+
+1. The balancer as a single point of failure. No VM to stop, no keepalived to build, a
+   zone-redundant frontend with a 99.99% SLA on the Standard SKU.
 2. VIP failover engineering. The 34-second total outage in Incident 4 has no equivalent.
-3. Patching and hardening a balancer OS.
-4. Probe state persistence across reloads.
+3. Patching and hardening a balancer operating system.
+4. Probe state lost across reloads.
 5. Capacity planning for the balancer host.
 
-**Azure does not remove:**
+**What Azure does not remove:**
 
 1. Probe misconfiguration (Incident 3). The portal will happily accept a probe port where
    nothing listens.
-2. NSG priority-ordering mistakes (Incident 2). Silent drops, first match wins, rules on
+2. NSG priority-ordering mistakes (Incident 2): silent drops, first match wins, rules on
    the subnet overriding rules on the NIC.
 3. Backend single points of failure. A one-VM pool is not highly available because the
    front door is.
-4. Request-level retry (Incident 1). Azure LB is flow-based: it cannot redispatch a
-   request the way HAProxy did. My zero-error result was a Layer 7 feature.
-5. Fast detection. Azure's probe interval floor is 5 seconds, so the same backend failure
-   takes about 10 seconds to notice at threshold 2, against the 1.5 seconds measured
-   here. Defaults make it 30 seconds.
+4. Request-level retry (Incident 1). Azure Load Balancer is flow-based and cannot
+   redispatch a request the way HAProxy did; my zero-error result was a Layer 7 feature.
+5. Fast detection. The probe interval floor is 5 seconds, so the same failure takes about
+   10 seconds to notice at threshold 2, against the 1.5 measured here. Defaults make it 30.
 6. Traffic imbalance (Incident 5). 5-tuple hashing and Client IP persistence are the same
    trade-offs as `mode tcp` and `balance source`, and Layer 4 metrics count flows, not
    requests.
 
-The short version: the managed service takes over the availability of the balancer
-itself, and leaves you owning the probe, the firewall rules, the pool, and the balancing
-key. Those four are exactly what the five incidents are about.
+In short: the managed service takes over the availability of the balancer itself and leaves
+you owning the probe, the firewall rules, the pool and the balancing key. Those four are
+exactly what the five incidents are about.
 
-## Deliberate deviations
+## 8. What I took away from it
 
-- **`mode http` instead of the `mode tcp` in the original brief.** HTTP mode lets the
-  probe request `/healthz` and assert a 200 instead of only proving that a socket
-  accepts connections. The TCP equivalent and the trade-off are written up in
-  `documentation/phase-4-load-balancer.md`, and Incident 5 shows an unexpected second
-  benefit: per-request balancing.
-- **Rebuilding the VMs rather than patching them.** The first build was unreliable
-  enough (see the install failure report) that a clean rebuild with a scripted cloud-init
-  seed was faster than repairing each guest by hand. The old `lb01` disk was backed up
-  outside the repository before deletion.
-- **`balance source` documented, not chosen.** It would have made a single test client
-  look like a healthy, even deployment while hiding a node failure, which is the opposite
-  of what a lab should demonstrate.
+The biggest lesson was the difference between having more than one server and having a
+highly available service. At the start the lab worked because everything was running.
+Deliberately breaking it showed me how each component contributes to whether the shop is
+reachable at all.
 
-## Where I would take it next
+What I actually practised here:
 
-- Build the keepalived + VRRP pair properly, with a second load balancer and a VIP, and
-  measure the actual failover time instead of quoting a design.
-- Add a fifth incident that combines two failures at once, because real outages rarely
-  arrive one at a time.
-- Repeat the probe timing on a larger node count to see where `leastconn` starts to beat
-  `roundrobin`.
+- Building and connecting four virtual machines and giving them stable addresses.
+- Provisioning Ubuntu Server unattended, and recovering when the installer failed.
+- Deploying Nginx and making two servers distinguishable.
+- Configuring HAProxy, a pool, round-robin and HTTP health checks.
+- Controlling access with firewall rules, and proving the boundary from both sides.
+- Simulating process, network, configuration and load-balancer failures.
+- Investigating availability from logs, counters and a live dashboard.
+- Identifying single points of failure, and saying plainly which ones remain.
+- Relating each local component to its Azure counterpart.
+
+Infrastructure engineering is not only about building systems that work. It is about
+understanding what happens when they stop working.
+
+## 9. Scope and limitations
+
+- The project was built on VirtualBox, not deployed to Azure.
+- The load balancer is a single HAProxy instance, and that is the largest remaining risk.
+- Two Nginx backend servers, no database, no sessions: the nodes are deliberately
+  stateless.
+- Five failure scenarios were tested and documented.
+- Keepalived and VRRP are documented as a proposed improvement, not implemented or tested.
+- Incidents 2, 3, 4 and 5 have measured terminal output but no screenshots; only the
+  healthy pool, the two web nodes and Incident 1 were captured visually.
+- This is a learning laboratory, not a production-ready architecture.
+
+The objective was to demonstrate practical understanding of load balancing, health
+monitoring, fault detection, network security and infrastructure reliability through
+hands-on failure testing, and to be honest about the parts that remained unbuilt.
+
+## Appendix — where everything lives
+
+### The build, phase by phase
+
+| File | Contents |
+| --- | --- |
+| `documentation/phase-1-environment-assessment.md` | Host capacity, VirtualBox and VT-x checks, VM sizing |
+| `documentation/phase-2-network.md` | VM creation, cloud-init, static addressing, ping matrix |
+| `documentation/phase-3-web-tier.md` | Nginx deployment, node identity, firewall boundary |
+| `documentation/phase-4-load-balancer.md` | HAProxy config, probes, algorithm choice, distribution evidence |
+| `documentation/phase-5-azure-mapping.md` | The lab translated into Azure terms, incident by incident |
+| `architecture/architecture-diagram.md` | Traffic paths, failure domains, what is redundant and what is not |
+| `architecture/ip-addressing-plan.md` | Full address plan, netplan, port table, Azure overlay |
+
+### The incidents
+
+| File | Incident |
+| --- | --- |
+| `troubleshooting/incident-01-backend-failure.md` | Process stopped: fast failure, redispatch, 1.5 s |
+| `troubleshooting/incident-02-network-failure.md` | Path blocked: silent drop, 9.3 s, customer timeouts |
+| `troubleshooting/incident-03-health-check-port.md` | Wrong probe port: healthy node removed, 2.4 s |
+| `troubleshooting/incident-04-load-balancer-failure.md` | Balancer stopped: total outage, keepalived/VRRP design |
+| `troubleshooting/incident-05-uneven-distribution.md` | Keep-alive pinning, `balance source`, why counters disagree |
+| `troubleshooting/install-autoinstall-failures.md` | Five provisioning failures and how I got past each |
+
+### Configuration and scripts
+
+| Path | Contents |
+| --- | --- |
+| `configuration/haproxy/haproxy.cfg` | Frontend, backend, probe, timeouts, stats listener |
+| `configuration/nginx/web01-*`, `web02-*` | Server blocks and pages for both nodes |
+| `configuration/autoinstall/user-data.tmpl`, `meta-data.tmpl` | cloud-init NoCloud templates |
+| `scripts/rebuild-lab-vms.sh` | Create the four VMs (prints a plan unless `CONFIRM=yes`) |
+| `scripts/install-guest.sh`, `finish-guest.sh` | Seed ISO, autoinstall, then switch to disk boot |
+| `scripts/deploy-nginx.sh`, `deploy-haproxy.sh` | Install the configs, with a timestamped backup |
+| `scripts/verify-web-tier.sh`, `verify-load-balancing.sh` | Firewall boundary, then distribution |
+| `scripts/probe-frontend.sh`, `watch-pool*.sh` | The samplers behind every incident timeline |
+
+### Rebuilding it yourself
+
+Prerequisites: VirtualBox 7.x with a host-only network `LabNet` on `192.168.56.0/24`, an
+Ubuntu Server 24.04 live ISO (expected at
+`~/Downloads/ubuntu-24.04.5-live-server-amd64.iso`, override with `ISO=`), about 4 GB of RAM
+and 80 GB of disk, and a gitignored `.secrets/` holding the lab account details and key.
+
+```bash
+CONFIRM=yes BACKUP=yes ./scripts/rebuild-lab-vms.sh
+./scripts/install-guest.sh lb01 192.168.56.10    # then web01 .21, web02 .22, client01 .31
+./scripts/finish-guest.sh  lb01 192.168.56.10    # same order
+./scripts/deploy-nginx.sh web01 && ./scripts/deploy-nginx.sh web02
+./scripts/deploy-haproxy.sh
+./scripts/verify-web-tier.sh && ./scripts/verify-load-balancing.sh 20
+```
+
+Expected result: the firewall matrix passes in both directions, and the 20 requests split
+10/10 with both servers `UP`, `check=L7OK`, `code=200`.
+
+### Screenshots
+
+`screenshots/` holds real captures only: the four VMs in VirtualBox Manager, each guest's
+details panel, a console for all four installs plus the stall and the recovery shell, both
+web nodes answering, the healthy pool, and Incident 1 caught mid-failure. The browser
+frames were taken with headless Chrome pointed at `192.168.56.10`; the console frames are
+from the VirtualBox display. Nothing was recreated.
 
 ---
 
