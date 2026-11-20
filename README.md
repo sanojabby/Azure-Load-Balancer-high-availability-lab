@@ -491,6 +491,16 @@ while detection was in progress.
 | Failed requests | 3 |
 | Health-check result | Layer 4 timeout |
 
+The dashboard caught this one too. `web01` is red with `L4TOUT in 2003ms` — the check ran
+to its full two-second timeout before the node was removed — while `web02` stayed green and
+absorbed the traffic:
+
+![HAProxy statistics page with web01 unreachable and checked as a Layer 4 timeout](screenshots/06-incident2-web01-unreachable.png)
+
+That row is the fingerprint. Incident 1 said `L4CON in 2ms`, because something answered with
+a refusal; here nothing answered at all, so the check burned its whole timeout before
+failing.
+
 **Recovery.** Remove the rule:
 
 ```bash
@@ -522,6 +532,14 @@ and customer requests continued through `web02` without an error.
 | Total requests | 60 |
 | Failed requests | 0 |
 | Backend capacity | halved |
+
+`web01` is red and out of the pool, exactly as it was in Incident 2, and yet the same
+machine answered `200` on port 80 every time I asked it, from `lb01` and from itself:
+
+![HAProxy statistics page with a healthy web01 removed by a check aimed at port 8080](screenshots/07-incident3-wrong-check-port.png)
+
+The row says `L4TOUT in 2003ms` against a server whose Nginx never stopped, because the
+check was knocking on port 8080 where nothing listens.
 
 **Recovery.** Put the correct configuration back and reload:
 
@@ -563,9 +581,14 @@ single test request failed.
 | Backend servers | both healthy |
 | Load balancer | unavailable |
 
-I tried to capture the browser's connection error and could not: headless Chrome exits
-cleanly on a failed navigation without writing an image. Rather than fake that frame, the
-outage stays a table of 33 failed requests.
+A plain headless navigation still will not save the frame: Chrome reports
+`net::ERR_CONNECTION_REFUSED` and exits without writing an image. Captured through the
+browser's debugging protocol instead, the outage looks like this:
+
+![Chrome reporting ERR_CONNECTION_REFUSED for the NordicShop frontend](screenshots/08-incident4-frontend-refused.png)
+
+That is the whole customer experience for those seconds: the address is correct, the
+connection is refused, and there is no second address to try.
 
 **Recovery.** Start it again:
 
@@ -607,6 +630,14 @@ request-level balancing. I compared them with the same client and the same load.
 The Layer 4 run put all ten requests on `web01` because they shared one persistent
 connection, and a Layer 4 balancer chooses per connection. The counters said so: `sessions=1`
 and `req_tot` blank, because it cannot count requests it never looks inside.
+
+The temporary frontend is still in the dashboard while the test runs, and it reports the
+ten requests as **one** unit of load:
+
+![HAProxy statistics page showing the Layer 4 demo backend with every session on web01](screenshots/09-incident5-layer4-pinning.png)
+
+`nordicshop_web_tcp` shows `web01` with `sessions=1`, `web02` with `0`, and blank request
+columns: a Layer 4 balancer cannot count requests inside a connection it never looks into.
 
 **Recovery.** Remove the temporary frontend and restore `balance roundrobin`:
 
@@ -715,8 +746,9 @@ understanding what happens when they stop working.
   stateless.
 - Five failure scenarios were tested and documented.
 - Keepalived and VRRP are documented as a proposed improvement, not implemented or tested.
-- Incidents 2, 3, 4 and 5 have measured terminal output but no screenshots; only the
-  healthy pool, the two web nodes and Incident 1 were captured visually.
+- Every incident was captured visually, either from the dashboard mid-failure or, for the
+  total outage, from the browser's own error page; the rest of the evidence is measured
+  terminal output.
 - This is a learning laboratory, not a production-ready architecture.
 
 The objective was to demonstrate practical understanding of load balancing, health
@@ -784,9 +816,13 @@ Expected result: the firewall matrix passes in both directions, and the 20 reque
 
 `screenshots/` holds real captures only: the four VMs in VirtualBox Manager, each guest's
 details panel, a console for all four installs plus the stall and the recovery shell, both
-web nodes answering, the healthy pool, and Incident 1 caught mid-failure. The browser
-frames were taken with headless Chrome pointed at `192.168.56.10`; the console frames are
-from the VirtualBox display. Nothing was recreated.
+web nodes answering, the healthy pool, and all five incidents caught as they happened. The
+browser frames were taken with headless Chrome pointed at `192.168.56.10`, except the total
+outage, where the balancer had nothing to answer with and the frame came from Chrome's own
+error page; the console frames are from the VirtualBox display. The frames for incidents 2
+to 5 were taken while re-running each fault to confirm it still behaves as documented, so
+the counters in them belong to that run, not to the request totals in the tables. Nothing
+was recreated.
 
 ---
 
